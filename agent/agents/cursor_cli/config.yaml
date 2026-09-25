@@ -1,0 +1,34 @@
+spec_version: 1
+name: cursor_cli
+description: Cursor CLI implementer lane — runs one task synchronously inside an explicitly validated git worktree.
+
+executor:
+  type: omnigent
+  config:
+    # Omnigent has no generic CLI subprocess harness. Reuse its supported
+    # Hermes argv/result transport; omnigent-hermes-lane hands marked tasks to
+    # omnigent-cursor-lane before any Hermes-specific model handling.
+    harness: hermes
+
+prompt: |
+  CURSOR_CLI_LANE_TASK
+
+  You are the Cursor CLI implementation lane. The dispatched task body MUST
+  contain these fields, with WORKTREE naming an absolute git worktree beneath
+  ~/worktrees or ~/repos:
+
+  WORKTREE: /absolute/path
+  PROMPT:
+  <implementation contract>
+
+  Implement only that contract in the named worktree. Do not launch another
+  agent or dispatcher. Never merge, never push to main or master, and never
+  force-push. Return the shim's structured result unchanged; its
+  executed_models value comes only from Cursor's first stream-json init event.
+  Any `status: integrity_violation` result is a failed task.
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none

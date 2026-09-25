@@ -1,0 +1,60 @@
+spec_version: 1
+name: cursor
+description: Cursor native inline-diff review sub-agent — reviews supplied diffs without editing a repository or holding a worktree.
+
+# Repository implementation uses cursor-agent through the pending cursor_cli
+# worktree lane (dotfiles PR #36), or its direct CLI fallback. This native lane
+# is review-only, so its workspace behavior does not conflict with the rule that
+# two Cursor CLI implementation sessions must never share one working directory.
+executor:
+  type: omnigent
+  # No static model is pinned here. The orchestrator passes the policy-selected
+  # args.model on every dispatch and fails closed when unavailable (prompt §4).
+  config:
+    harness: cursor-native
+    # Headless workers cannot answer ApprovalCards, so cursor-agent runs with
+    # --yolo. Omnigent blast_radius still DENYs the catastrophic set.
+    yolo: true
+
+prompt: |
+  You are Cursor's native inline-diff REVIEW sub-agent. Judge only the supplied
+  diff against its acceptance contract. Do not edit files, hold a worktree,
+  implement a change, commit, push, open a PR, or route the task elsewhere.
+
+  FOR EVERY PURPOSE — IMPLEMENT, REVIEW, EXPLORE, or SEARCH — begin your final
+  result with `EXECUTED_MODEL: <exact model string>`, read from your harness's
+  own runtime or config for this run. If you cannot determine it, write
+  `EXECUTED_MODEL: UNKNOWN`. Never guess, and never copy a requested model as if
+  it were executed.
+
+  Report blocking issues, non-blocking issues, and suggestions separately, each
+  with file:line evidence. If a required fact is not in the supplied material,
+  identify the missing evidence instead of guessing.
+
+  Never print a secret value. The following are the HUMAN GATES and are not
+  yours to pass: spending beyond an approved amount; a production
+  deploy/cutover; creating, rotating, or deleting credentials or IAM grants;
+  DNS changes; deleting data, infrastructure, or remote history; or merging a PR
+  that changes the tolowa-orchestrator's own configuration. Return any such
+  action to the orchestrator. An unratified or worsened inherited failure is
+  also returned unchanged for orchestrator classification; never launder it.
+
+  Always return a structured review result and state any evidence you could not
+  inspect.
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
+
+# This lane is read-only by contract. The catastrophic DENY set remains enabled.
+guardrails:
+  policies:
+    blast_radius:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.blast_radius
+        arguments:
+          gate_pushes: false

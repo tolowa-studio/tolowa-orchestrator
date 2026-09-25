@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+# Laptop shim for the m2-mini Hermes kanban builder. The Mini profile and its
+# credential are installed manually by the operator; this script never reads or
+# writes either one locally.
+set -euo pipefail
+
+HOST=m2-mini
+MODEL=deepseek-ai/DeepSeek-V4-Pro
+WAIT_S="${OMNIGENT_HERMES_WAIT_S:-540}"
+R='~/.hermes/profiles/tolowa-builder/bin/lane-remote'
+LANE_STARTED_S=$SECONDS
+SUBMIT_MAX_S=30
+WAIT_RESULT_GRACE_S=20
+
+# The Mini's ssh service can report success even when its remote command failed.
+# Capture its output and use the lane protocol, never ssh's exit status, as proof
+# that a lane action completed. The watchdog is deliberately implemented in bash
+# because macOS does not provide GNU timeout by default.
+remote_capture() {
+  local action=$1 timeout_s=$2
+  shift 2
+  local stdout_file stderr_file timeout_file done_file stdin_file ssh_pid watchdog_pid
+  stdout_file=$(mktemp)
+  stderr_file=$(mktemp)
+  timeout_file=$(mktemp)
+  done_file=$(mktemp)
+  stdin_file=$(mktemp)
+  # The submit body arrives through this function's stdin. Preserve it before
+  # launching ssh in the background: non-interactive shells otherwise connect
+  # asynchronous commands to /dev/null. All actions still receive an explicit
+  # stdin file, but only submit reads caller stdin so readiness, wait, and
+  # cancel never wait on an interactive terminal. The only submit caller below
+  # uses a here-string, so this copy is already buffered and needs no separate
+  # timeout; a future pipe from a live producer must add one. A closed stdin
+  # still makes cat fail under set -e rather than emitting a lane protocol
+  # result, which is unreachable from that current here-string caller.
+  if [[ "$action" == submit && ! -t 0 ]]; then
+    cat >"$stdin_file"
+  fi
+  rm -f "$done_file"
+  REMOTE_TIMED_OUT=false
+  ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 "$HOST" "$R" "$action" "$@" <"$stdin_file" >"$stdout_file" 2>"$stderr_file" &
+  ssh_pid=$!
+  (
+    timer_pid=''
+    stop_watchdog() {
+      [[ -n "$timer_pid" ]] && kill "$timer_pid" 2>/dev/null || true
+      exit 0
+    }
+    trap stop_watchdog TERM INT
+    sleep "$timeout_s" &
+    timer_pid=$!
+    wait "$timer_pid" || exit 0
+    if [[ ! -e "$done_file" ]] && kill -0 "$ssh_pid" 2>/dev/null; then
+      printf '%s\n' timed_out >"$timeout_file"
+      kill -TERM "$ssh_pid" 2>/dev/null || true
+      kill -KILL "$ssh_pid" 2>/dev/null || true
+    fi
+  ) </dev/null >/dev/null 2>&1 &
+  watchdog_pid=$!
+  set +e
+  wait "$ssh_pid"
+  REMOTE_STATUS=$?
+  touch "$done_file"
+  kill "$watchdog_pid" 2>/dev/null
+  wait "$watchdog_pid" 2>/dev/null
+  set -e
+  [[ -s "$timeout_file" ]] && REMOTE_TIMED_OUT=true
+  # Command substitution otherwise discards trailing newlines, which would make
+  # a multi-line submit response indistinguishable from one task ID.
+  REMOTE_STDOUT=$( { cat "$stdout_file"; printf '\001'; } )
+  REMOTE_STDOUT=${REMOTE_STDOUT%$'\001'}
+  REMOTE_STDERR=$(<"$stderr_file")
+  # Do not use a per-call RETURN/EXIT trap here: TERM/INT can invoke the
+  # nested cancel remote_capture(), and Bash does not reliably restore an
+  # enclosing per-call trap after that async handler returns. TERM/INT returns
+  # to this unconditional cleanup path; cleanup is not guaranteed after a
+  # separate failure before reaching this point.
+  rm -f "$stdout_file" "$stderr_file" "$timeout_file" "$done_file" "$stdin_file"
+}
+
+remaining_budget_s() {
+  local remaining=$(( WAIT_S - (SECONDS - LANE_STARTED_S) ))
+  (( remaining > 0 )) || return 1
+  printf '%s\n' "$remaining"
+}
+
+has_query=false
+has_readiness=false
+has_model=false
+has_resume=false
+for arg in "$@"; do
+  case "$arg" in
+    -q) has_query=true ;;
+    --readiness) has_readiness=true ;;
+    -m) has_model=true ;;
+    --resume) has_resume=true ;;
+  esac
+done
+
+# Omnigent uses this one command for both hermes and hermes-native. Only the
+# subprocess builder lane supplies -q, --readiness, or --resume; leave other harnesses
+# exactly on the real Hermes CLI.
+# Preserve the original dispatch rule: only these builder-lane selectors choose
+# the lane. In particular, a bare `chat` (or `chat` with real-CLI-only flags)
+# stays a real-Hermes passthrough, so accepting `chat` below cannot capture a
+# genuine hermes-native invocation.
+if [[ "$has_query" == false && "$has_readiness" == false && "$has_model" == false && "$has_resume" == false ]]; then
+  real_bin="${OMNIGENT_HERMES_REAL_BIN:-$HOME/.local/bin/hermes}"
+  if [[ ! -x "$real_bin" || "$real_bin" -ef "$0" ]]; then
+    printf 'OMNIGENT_HERMES_REAL_BIN_INVALID: %s\n' "$real_bin" >&2
+    exit 2
+  fi
+  exec "$real_bin" "$@"
+fi
+
+if ! [[ "$WAIT_S" =~ ^[0-9]+$ ]] || (( WAIT_S < 1 || WAIT_S > 540 )); then
+  printf 'WAIT_SECONDS_REJECTED: must be an integer from 1 through 540\n' >&2
+  exit 2
+fi
+
+if "$has_readiness"; then
+  (($# == 1)) || { printf '%s\n' '--readiness accepts no additional arguments' >&2; exit 2; }
+  remote_capture readiness 30
+  if [[ -n "$REMOTE_STDOUT" ]]; then
+    printf '%s\n' "$REMOTE_STDOUT"
+  fi
+  if [[ -n "$REMOTE_STDERR" ]]; then
+    printf '%s\n' "$REMOTE_STDERR" >&2
+  fi
+  if (( REMOTE_STATUS == 0 )) && python3 -c '
+import json
+import sys
+
+for line in reversed(sys.stdin.read().splitlines()):
+    try:
+        value = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    raise SystemExit(0 if isinstance(value, dict) and value.get("ready") is True else 1)
+raise SystemExit(1)
+' <<<"$REMOTE_STDOUT"; then
+    exit 0
+  fi
+  exit 1
+fi
+
+message=''
+requested_model=''
+
+# Omnigent 0.14 invokes its Hermes harness as:
+#   chat -q <message> -Q --source tool [-m <model>] [--resume <id>]
+#   [-s <skills> | --ignore-rules]
+# `chat` is accepted only here, after the existing lane-selection rule above,
+# and only as the first token. The integration metadata does not affect the
+# remote builder task, so -Q, --source, -s, and --ignore-rules are ignored.
+if (($#)) && [[ "$1" == chat ]]; then
+  shift
+fi
+
+while (($#)); do
+  case "$1" in
+    -q)
+      (($# >= 2)) || { printf '%s\n' 'missing value for -q' >&2; exit 2; }
+      message="$2"
+      shift 2
+      ;;
+    -m)
+      (($# >= 2)) || { printf '%s\n' 'missing value for -m' >&2; exit 2; }
+      requested_model="$2"
+      shift 2
+      ;;
+    --resume)
+      # Omnigent may pass --resume on every turn in a session; only an explicit
+      # HERMES_LANE_RESUME line in the task body may resume a prior task.
+      (($# >= 2)) || { printf '%s\n' 'missing value for --resume' >&2; exit 2; }
+      shift 2
+      ;;
+    -Q|--ignore-rules)
+      shift
+      ;;
+    -s|--source)
+      (($# >= 2)) || { printf '%s\n' "missing value for $1" >&2; exit 2; }
+      shift 2
+      ;;
+    *)
+      printf 'unsupported argument: %s\n' "$1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ "$message" == *CURSOR_CLI_LANE_TASK* ]]; then
+  cursor_lane_bin="${OMNIGENT_CURSOR_LANE_BIN:-$HOME/.local/bin/omnigent-cursor-lane}"
+  if [[ ! -x "$cursor_lane_bin" ]]; then
+    printf 'CURSOR_CLI_LANE_BIN_INVALID: %s\n' "$cursor_lane_bin" >&2
+    exit 2
+  fi
+  cursor_args=(--task "$message")
+  if [[ -n "$requested_model" ]]; then
+    cursor_args+=(--model "$requested_model")
+  fi
+  exec "$cursor_lane_bin" "${cursor_args[@]}"
+fi
+
+if [[ -n "$requested_model" && "$requested_model" != "$MODEL" ]]; then
+  printf 'MODEL_PIN_REJECTED\n' >&2
+  exit 2
+fi
+
+task_id=''
+# Validate a supplied resume target before a signal can cause cancel_task() to
+# act on it. A resume marker is a task ID, not an arbitrary remote argument.
+if [[ "$message" =~ HERMES_LANE_RESUME[[:space:]]+([^[:space:]]+) ]]; then
+  task_id="${BASH_REMATCH[1]}"
+  [[ "$task_id" =~ ^[[:alnum:]_-]{1,64}$ ]] || { printf '%s\n' 'HERMES_LANE_RESUME_INVALID: invalid task id' >&2; exit 2; }
+fi
+
+cancel_task() {
+  if [[ -n "$task_id" ]]; then
+    remote_capture cancel 10 "$task_id" || true
+  fi
+}
+trap cancel_task TERM INT
+
+if [[ -z "$task_id" ]]; then
+  [[ -n "$message" ]] || { printf '%s\n' 'missing task message (-q)' >&2; exit 2; }
+  remaining_s=$(remaining_budget_s) || { printf '%s\n' 'HERMES_LANE_SUBMIT_TIMEOUT: total lane budget exhausted' >&2; exit 1; }
+  submit_timeout_s=$remaining_s
+  (( submit_timeout_s > SUBMIT_MAX_S )) && submit_timeout_s=$SUBMIT_MAX_S
+  remote_capture submit "$submit_timeout_s" <<<"$message"
+  submit_id="$REMOTE_STDOUT"
+  [[ "$submit_id" == *$'\n' ]] && submit_id=${submit_id%$'\n'}
+  if [[ "$REMOTE_TIMED_OUT" == true ]]; then
+    if [[ "$submit_id" =~ ^[[:alnum:]_-]{1,64}$ ]]; then
+      task_id="$submit_id"
+      printf 'session_id: %s\n' "$task_id"
+      printf '%s\n' 'HERMES_LANE_RESULT {"status":"running","identity":"UNKNOWN","integrity":"REVIEW_NEEDED","error":"submit timed out after task id was received"}'
+      exit 0
+    fi
+    printf '%s\n' 'HERMES_LANE_SUBMIT_TIMEOUT: no task id received' >&2
+    exit 1
+  fi
+  if (( REMOTE_STATUS != 0 )) || ! [[ "$submit_id" =~ ^[[:alnum:]_-]{1,64}$ ]]; then
+    printf 'HERMES_LANE_SUBMIT_FAILED'
+    if [[ -n "$REMOTE_STDERR" ]]; then
+      printf ': %s' "$REMOTE_STDERR"
+    fi
+    printf '\n' >&2
+    exit 1
+  fi
+  task_id="$submit_id"
+fi
+
+[[ "$task_id" =~ ^[[:alnum:]_-]{1,64}$ ]] || { printf '%s\n' 'HERMES_LANE_SUBMIT_FAILED: invalid task id' >&2; exit 1; }
+printf 'session_id: %s\n' "$task_id"
+remaining_s=$(remaining_budget_s) || {
+  printf '%s\n' 'HERMES_LANE_RESULT {"status":"running","identity":"UNKNOWN","integrity":"REVIEW_NEEDED","error":"total lane budget exhausted after task id was received"}'
+  exit 0
+}
+if (( remaining_s <= WAIT_RESULT_GRACE_S )); then
+  printf '%s\n' 'HERMES_LANE_RESULT {"status":"running","identity":"UNKNOWN","integrity":"REVIEW_NEEDED","error":"insufficient wait budget after task id was received"}'
+  exit 0
+fi
+remote_capture wait "$remaining_s" "$task_id" "$(( remaining_s - WAIT_RESULT_GRACE_S ))"
+if [[ -n "$REMOTE_STDOUT" ]]; then
+  printf '%s\n' "$REMOTE_STDOUT"
+fi
+if [[ -n "$REMOTE_STDERR" ]]; then
+  printf '%s\n' "$REMOTE_STDERR" >&2
+fi
+if [[ "$REMOTE_STDOUT" != *'HERMES_LANE_RESULT '* ]]; then
+  printf '%s\n' 'HERMES_LANE_RESULT {"status":"unknown","identity":"UNKNOWN","integrity":"REVIEW_NEEDED","error":"no result line"}'
+fi
+exit 0

@@ -1,0 +1,24 @@
+spec_version: 1
+name: hermes
+description: Hermes kanban builder lane — implement-only work dispatched through the laptop hermes subprocess shim.
+
+executor:
+  type: omnigent
+  config:
+    # This is the `hermes` subprocess harness, not broken `hermes-native`.
+    harness: hermes
+
+prompt: |
+  You are the Hermes builder lane. You implement only the task body forwarded to
+  you verbatim as a kanban task. The body MUST contain both `REPO:
+  <owner>/<repo>` and `TITLE: <slug>` lines. Work only on that task; end every
+  task in a pull request and never merge it.
+
+  Do not route this task through BATON or any other dispatcher unless the
+  contract explicitly says to.
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none

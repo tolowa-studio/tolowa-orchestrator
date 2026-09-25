@@ -1,0 +1,670 @@
+#!/usr/bin/env node
+
+import { spawn, spawnSync } from "node:child_process";
+import {
+  accessSync,
+  chmodSync,
+  constants,
+  mkdtempSync,
+  mkdirSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import path from "node:path";
+
+const MARKER = "CURSOR_CLI_LANE_TASK";
+const PROTECTED_BRANCHES = new Set(["main", "master"]);
+
+function result(status, executedModels, finalText, exit, error) {
+  const value = {
+    status,
+    executed_models: executedModels.length ? executedModels : ["UNKNOWN"],
+    final_text: finalText,
+    exit,
+  };
+  if (error) value.error = error;
+  process.stdout.write(`${JSON.stringify(value)}\n`);
+}
+
+function findExecutable(name, searchPath = process.env.PATH || "") {
+  if (name.includes(path.sep)) {
+    try {
+      accessSync(name, constants.X_OK);
+      return realpathSync(name);
+    } catch {
+      return null;
+    }
+  }
+  for (const directory of searchPath.split(path.delimiter)) {
+    if (!directory) continue;
+    const candidate = path.join(directory, name);
+    try {
+      accessSync(candidate, constants.X_OK);
+      return realpathSync(candidate);
+    } catch {
+      // Continue searching PATH.
+    }
+  }
+  return null;
+}
+
+function resolveCursorAgentEnv(overrides = {}) {
+  const env = { ...process.env, ...overrides };
+  if (env.AGENT_CLI_CREDENTIAL_STORE === undefined) {
+    env.AGENT_CLI_CREDENTIAL_STORE = "memory";
+  }
+  if (!env.CURSOR_API_KEY && !env.CURSOR_AUTH_TOKEN && !process.env.OMNIGENT_CURSOR_LANE_DISABLE_API_KEY_VAULT) {
+    const gcloud = findExecutable("gcloud");
+    if (gcloud) {
+      const result = spawnSync(
+        gcloud,
+        [
+          "secrets",
+          "versions",
+          "access",
+          "latest",
+          "--secret=motion-cursor-api-key",
+          "--project=tolowa-studio",
+          "--quiet",
+        ],
+        { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 30_000 },
+      );
+      if (!result.error && result.status === 0 && result.stdout.trim()) {
+        env.CURSOR_API_KEY = result.stdout.trim();
+      }
+    }
+  }
+  return env;
+}
+
+function hasCursorApiKeyAuth(env) {
+  return Boolean((env.CURSOR_API_KEY || env.CURSOR_AUTH_TOKEN || "").trim());
+}
+
+function authReadyViaModels(cursorAgent, env) {
+  const check = spawnSync(cursorAgent, ["models"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 15_000,
+    env,
+  });
+  if (check.error || check.status !== 0) return false;
+  const output = `${check.stdout || ""}\n${check.stderr || ""}`;
+  if (!/available models/i.test(output)) return false;
+  if (/invalid|not logged in|unauthor/i.test(output)) return false;
+  return true;
+}
+
+function authReady(cursorAgent, env) {
+  if (hasCursorApiKeyAuth(env)) {
+    return authReadyViaModels(cursorAgent, env);
+  }
+  for (const command of ["status", "whoami"]) {
+    const check = spawnSync(cursorAgent, [command], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 15_000,
+      env,
+    });
+    if (check.error || check.status !== 0) continue;
+    const output = `${check.stdout || ""}\n${check.stderr || ""}`.trim();
+    const normalized = output.toLowerCase();
+    if (/not logged in|not authenticated|unauthenticated|logged out|authentication required|login required/.test(normalized)) {
+      continue;
+    }
+    if (command === "status" && /logged in|authenticated|signed in/.test(normalized)) return true;
+    if (command === "whoami" && output.length > 0) return true;
+  }
+  return false;
+}
+
+function readiness() {
+  const cursorAgent = findExecutable("cursor-agent");
+  const env = resolveCursorAgentEnv();
+  const ready = Boolean(cursorAgent && authReady(cursorAgent, env));
+  process.stdout.write(`${JSON.stringify({ ready, authenticated: ready })}\n`);
+  return ready ? 0 : 1;
+}
+
+function parseArgs(argv) {
+  const parsed = { model: "", prompt: "", task: "", worktree: "" };
+  let index = argv[0] === "chat" ? 1 : 0;
+  while (index < argv.length) {
+    const arg = argv[index];
+    if (["--worktree", "--prompt", "--task", "-q", "--model", "-m"].includes(arg)) {
+      if (index + 1 >= argv.length) throw new Error(`missing value for ${arg}`);
+      const value = argv[index + 1];
+      if (arg === "--worktree") parsed.worktree = value;
+      else if (arg === "--prompt") parsed.prompt = value;
+      else if (arg === "--task" || arg === "-q") parsed.task = value;
+      else parsed.model = value;
+      index += 2;
+      continue;
+    }
+    if (arg === "-Q" || arg === "--ignore-rules") {
+      index += 1;
+      continue;
+    }
+    if (arg === "--source" || arg === "-s") {
+      if (index + 1 >= argv.length) throw new Error(`missing value for ${arg}`);
+      index += 2;
+      continue;
+    }
+    if (arg === "--resume") {
+      throw new Error("cursor_cli tasks are single-turn and cannot be resumed");
+    }
+    throw new Error(`unsupported argument: ${arg}`);
+  }
+
+  if (parsed.task) {
+    const lines = parsed.task.split(/\r?\n/);
+    for (const line of lines) {
+      const match = line.match(/^WORKTREE:\s*(.+?)\s*$/);
+      if (match && (match[1].startsWith("/") || match[1].startsWith("~/"))) {
+        parsed.worktree = match[1];
+      }
+    }
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      if (/^PROMPT:\s*$/.test(lines[i])) {
+        parsed.prompt = lines.slice(i + 1).join("\n").trim();
+        break;
+      }
+    }
+    if (!parsed.prompt) parsed.prompt = parsed.task;
+  }
+  return parsed;
+}
+
+function expandHome(value) {
+  return value === "~" ? homedir() : value.startsWith("~/") ? path.join(homedir(), value.slice(2)) : value;
+}
+
+function inside(root, target) {
+  const relative = path.relative(root, target);
+  return relative !== "" && !relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative);
+}
+
+function gitOutput(git, args, cwd) {
+  const run = spawnSync(git, args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  if (run.error || run.status !== 0) throw new Error(`git ${args[0]} failed for worktree`);
+  return run.stdout.trim();
+}
+
+function validateWorktree(value, git) {
+  if (!value) throw new Error("missing worktree path");
+  const requested = path.resolve(expandHome(value));
+  const resolved = realpathSync(requested);
+  if (!statSync(resolved).isDirectory()) throw new Error("worktree path is not a directory");
+
+  const roots = [path.join(homedir(), "worktrees"), path.join(homedir(), "repos")]
+    .map((root) => {
+      try {
+        return realpathSync(root);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+  if (!roots.some((root) => inside(root, resolved))) {
+    throw new Error("worktree must resolve beneath ~/worktrees or ~/repos");
+  }
+
+  const topLevel = realpathSync(gitOutput(git, ["rev-parse", "--show-toplevel"], resolved));
+  if (topLevel !== resolved) throw new Error("worktree path must be the git worktree root");
+  const branch = gitOutput(git, ["symbolic-ref", "--quiet", "--short", "HEAD"], resolved);
+  if (PROTECTED_BRANCHES.has(branch)) throw new Error(`refusing protected branch: ${branch}`);
+  return resolved;
+}
+
+function runGit(git, args, cwd, failureMessage) {
+  const run = spawnSync(git, args, {
+    cwd,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (run.error || run.status !== 0) throw new Error(failureMessage);
+  return run.stdout.trim();
+}
+
+function optionalGitConfig(git, args, cwd) {
+  const run = spawnSync(git, ["config", ...args], {
+    cwd,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (!run.error && run.status === 0) return run.stdout.trim();
+  if (!run.error && run.status === 1) return null;
+  throw new Error(`git config ${args.at(-1)} failed`);
+}
+
+function setGitConfig(git, args, cwd) {
+  const run = spawnSync(git, ["config", ...args], { cwd, stdio: "ignore" });
+  if (run.error || run.status !== 0) throw new Error(`git config ${args.at(-2) || args.at(-1)} failed`);
+}
+
+function resolvePriorHook(git, worktree, hooksPath) {
+  let candidate;
+  if (hooksPath) {
+    if (path.isAbsolute(hooksPath)) candidate = path.join(hooksPath, "pre-push");
+    else {
+      const gitDirectory = gitOutput(git, ["rev-parse", "--git-dir"], worktree);
+      candidate = path.resolve(worktree, gitDirectory, hooksPath, "pre-push");
+    }
+  } else {
+    const defaultHook = gitOutput(git, ["rev-parse", "--git-path", "hooks/pre-push"], worktree);
+    candidate = path.resolve(worktree, defaultHook);
+  }
+  try {
+    accessSync(candidate, constants.X_OK);
+    return realpathSync(candidate);
+  } catch {
+    return null;
+  }
+}
+
+function installRepositoryGuard(git, worktree) {
+  const extensionValue = optionalGitConfig(git, ["--local", "--get", "extensions.worktreeConfig"], worktree);
+  const effectiveHooksPath = optionalGitConfig(git, ["--get", "core.hooksPath"], worktree);
+  const priorHook = resolvePriorHook(git, worktree, effectiveHooksPath);
+
+  setGitConfig(git, ["--local", "extensions.worktreeConfig", "true"], worktree);
+  const worktreeHooksPath = optionalGitConfig(git, ["--worktree", "--get", "core.hooksPath"], worktree);
+  let hookDirectory;
+  try {
+    hookDirectory = mkdtempSync(path.join(worktree, ".omnigent-cursor-hooks-"));
+    const hookPath = path.join(hookDirectory, "pre-push");
+    writeFileSync(path.join(hookDirectory, ".gitignore"), "*\n");
+    const chainPriorHook = priorHook
+      ? `${shellQuote(priorHook)} "$@" <"$payload"\n`
+      : "";
+    writeFileSync(hookPath, `#!/usr/bin/env bash
+set -euo pipefail
+payload=$(mktemp)
+trap 'rm -f "$payload"' EXIT
+cat >"$payload"
+while read -r local_ref local_sha remote_ref remote_sha; do
+  case "$remote_ref" in
+    refs/heads/main|refs/heads/master)
+      printf '%s\\n' 'CURSOR_LANE_POLICY: protected branch push rejected by pre-push hook' >&2
+      exit 64
+      ;;
+  esac
+done <"$payload"
+${chainPriorHook}exit 0
+`, { mode: 0o755 });
+    setGitConfig(git, ["--worktree", "core.hooksPath", hookDirectory], worktree);
+  } catch (error) {
+    if (extensionValue === null) {
+      spawnSync(git, ["config", "--local", "--unset-all", "extensions.worktreeConfig"], { cwd: worktree, stdio: "ignore" });
+    } else {
+      spawnSync(git, ["config", "--local", "extensions.worktreeConfig", extensionValue], { cwd: worktree, stdio: "ignore" });
+    }
+    if (hookDirectory) rmSync(hookDirectory, { recursive: true, force: true });
+    throw error;
+  }
+
+  return () => {
+    let cleanupError = "";
+    try {
+      if (worktreeHooksPath === null) {
+        const unset = spawnSync(git, ["config", "--worktree", "--unset-all", "core.hooksPath"], {
+          cwd: worktree,
+          stdio: "ignore",
+        });
+        if (unset.error || ![0, 1, 5].includes(unset.status)) throw new Error("failed to remove worktree hooksPath");
+      } else {
+        setGitConfig(git, ["--worktree", "core.hooksPath", worktreeHooksPath], worktree);
+      }
+    } catch (error) {
+      cleanupError = error.message;
+    }
+    try {
+      if (extensionValue === null) {
+        const unset = spawnSync(git, ["config", "--local", "--unset-all", "extensions.worktreeConfig"], {
+          cwd: worktree,
+          stdio: "ignore",
+        });
+        if (unset.error || ![0, 1, 5].includes(unset.status)) throw new Error("failed to restore extensions.worktreeConfig");
+      } else {
+        setGitConfig(git, ["--local", "extensions.worktreeConfig", extensionValue], worktree);
+      }
+    } catch (error) {
+      cleanupError = cleanupError || error.message;
+    }
+    rmSync(hookDirectory, { recursive: true, force: true });
+    if (cleanupError) throw new Error(cleanupError);
+  };
+}
+
+function protectedRemoteSnapshot(git, worktree, targets = null) {
+  const remoteTargets = targets || gitOutput(git, ["remote"], worktree)
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .sort()
+    .map((name) => ({
+      name,
+      url: runGit(git, ["remote", "get-url", "--push", name], worktree, `cannot resolve push URL for remote ${name}`),
+    }));
+  const refs = {};
+  for (const target of remoteTargets) {
+    const output = runGit(
+      git,
+      ["ls-remote", "--heads", target.url, "refs/heads/main", "refs/heads/master"],
+      worktree,
+      `cannot verify protected refs for remote ${target.name}`,
+    );
+    refs[target.name] = output.split(/\r?\n/).filter(Boolean).sort();
+  }
+  return { targets: remoteTargets, refs };
+}
+
+function snapshotsMatch(before, after) {
+  return JSON.stringify(before.refs) === JSON.stringify(after.refs);
+}
+
+function shellQuote(value) {
+  return `'${value.replaceAll("'", `'\"'\"'`)}'`;
+}
+
+function createCommandGuards(realGit, realGh, worktree) {
+  const directory = mkdtempSync(path.join(tmpdir(), "omnigent-cursor-lane-"));
+  const ghConfigDirectory = path.join(directory, "gh-config");
+  mkdirSync(ghConfigDirectory, { mode: 0o700 });
+  const gitGuard = `#!/usr/bin/env bash
+set -euo pipefail
+validated_worktree=${shellQuote(worktree)}
+operation=''
+effective_cwd="$PWD"
+unsafe_context=false
+args=("$@")
+i=0
+while (( i < \${#args[@]} )); do
+  arg="\${args[$i]}"
+  case "$arg" in
+    -C)
+      i=$((i + 1))
+      (( i < \${#args[@]} )) || exit 2
+      next_cwd="\${args[$i]}"
+      [[ "$next_cwd" == /* ]] || next_cwd="$effective_cwd/$next_cwd"
+      effective_cwd=$(cd "$next_cwd" 2>/dev/null && pwd -P) || exit 2
+      ;;
+    -C*)
+      next_cwd="\${arg#-C}"
+      [[ "$next_cwd" == /* ]] || next_cwd="$effective_cwd/$next_cwd"
+      effective_cwd=$(cd "$next_cwd" 2>/dev/null && pwd -P) || exit 2
+      ;;
+    -c) i=$((i + 1)) ;;
+    --git-dir|--work-tree) unsafe_context=true; i=$((i + 1)) ;;
+    -*) ;;
+    *) operation="$arg"; break ;;
+  esac
+  i=$((i + 1))
+done
+case "$operation" in
+  merge|pull)
+    printf '%s\\n' 'CURSOR_LANE_POLICY: merge operations are forbidden' >&2
+    exit 64
+    ;;
+  push)
+    if [[ "$unsafe_context" == true ]]; then
+      printf '%s\\n' 'CURSOR_LANE_POLICY: push with explicit git/work tree is forbidden' >&2
+      exit 64
+    fi
+    candidate_root=$(${shellQuote(realGit)} -C "$effective_cwd" rev-parse --show-toplevel 2>/dev/null || true)
+    if [[ "$candidate_root" != "$validated_worktree" ]]; then
+      printf '%s\\n' 'CURSOR_LANE_POLICY: push outside validated worktree is forbidden' >&2
+      exit 64
+    fi
+    for arg in "$@"; do
+      case "$arg" in
+        --force|--force-with-lease|--all|--mirror|--no-verify|-n|main|master|+main|+master|refs/heads/main|refs/heads/master|+refs/heads/main|+refs/heads/master|*:main|*:master|*:refs/heads/main|*:refs/heads/master)
+          printf '%s\\n' 'CURSOR_LANE_POLICY: protected or force push is forbidden' >&2
+          exit 64
+          ;;
+      esac
+    done
+    ;;
+  switch|checkout|branch|update-ref)
+    for arg in "$@"; do
+      case "$arg" in
+        main|master|refs/heads/main|refs/heads/master)
+          printf '%s\\n' 'CURSOR_LANE_POLICY: protected branch mutation is forbidden' >&2
+          exit 64
+          ;;
+      esac
+    done
+    ;;
+  config)
+    for arg in "$@"; do
+      case "$arg" in
+        *core.hooksPath*|*extensions.worktreeConfig*)
+          printf '%s\\n' 'CURSOR_LANE_POLICY: safety-hook configuration is forbidden' >&2
+          exit 64
+          ;;
+      esac
+    done
+    ;;
+esac
+exec ${shellQuote(realGit)} "$@"
+`;
+  writeFileSync(path.join(directory, "git"), gitGuard, { mode: 0o755 });
+
+  if (realGh) {
+    const ghGuard = `#!/usr/bin/env bash
+set -euo pipefail
+previous=''
+for arg in "$@"; do
+  if [[ "$previous" == pr && "$arg" == merge ]]; then
+    printf '%s\\n' 'CURSOR_LANE_POLICY: pull-request merges are forbidden' >&2
+    exit 64
+  fi
+  case "$arg" in
+    */merge|*/merge\?*|*/merges|*/merges\?*)
+      printf '%s\\n' 'CURSOR_LANE_POLICY: merge API calls are forbidden' >&2
+      exit 64
+      ;;
+  esac
+  previous="$arg"
+done
+exec ${shellQuote(realGh)} "$@"
+`;
+    writeFileSync(path.join(directory, "gh"), ghGuard, { mode: 0o755 });
+  }
+  chmodSync(directory, 0o700);
+  return { directory, ghConfigDirectory };
+}
+
+function textFromMessage(message) {
+  if (!message || !Array.isArray(message.content)) return "";
+  return message.content
+    .filter((item) => item && item.type === "text" && typeof item.text === "string")
+    .map((item) => item.text)
+    .join("\n");
+}
+
+function captureExecutedModel(event, executedModel) {
+  if (
+    !executedModel &&
+    event?.type === "system" &&
+    event?.subtype === "init" &&
+    typeof event.model === "string" &&
+    event.model.trim()
+  ) {
+    return event.model.trim();
+  }
+  return executedModel;
+}
+
+async function runCursor(cursorAgent, worktree, model, prompt, commandGuards) {
+  const safetyPrompt = `${prompt}\n\n${[
+    "LANE SAFETY RULES (mandatory):",
+    `- Work only inside ${worktree}.`,
+    "- Do the work directly; do not launch cursor-agent, codex, claude, or any other agent.",
+    "- Never merge. Never push to main or master. Never force-push.",
+    "- If a pull request is required, push only the current feature branch and open the PR without merging it.",
+  ].join("\n")}`;
+  const args = ["-p", "--trust", "--model", model, "--output-format", "stream-json", safetyPrompt];
+  const childEnv = resolveCursorAgentEnv({
+    PATH: `${commandGuards.directory}${path.delimiter}${process.env.PATH || ""}`,
+    GH_CONFIG_DIR: commandGuards.ghConfigDirectory,
+  });
+  delete childEnv.GH_TOKEN;
+  delete childEnv.GITHUB_TOKEN;
+  delete childEnv.GH_ENTERPRISE_TOKEN;
+  delete childEnv.GITHUB_ENTERPRISE_TOKEN;
+  const child = spawn(cursorAgent, args, {
+    cwd: worktree,
+    env: childEnv,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const completion = await new Promise((resolve) => {
+    child.once("error", (error) => resolve({ code: 127, error }));
+    child.once("close", (code, signal) => resolve({ code: code ?? 1, signal }));
+  });
+
+  let executedModel = "";
+  let finalText = "";
+  let streamReportedError = false;
+  for (const line of stdout.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    executedModel = captureExecutedModel(event, executedModel);
+    if (event.type === "result") {
+      if (typeof event.result === "string") finalText = event.result;
+      if (event.is_error === true || event.subtype === "error") streamReportedError = true;
+    } else if (event.type === "assistant") {
+      const assistantText = textFromMessage(event.message);
+      if (assistantText) finalText = assistantText;
+    }
+  }
+
+  let exit = completion.code;
+  let error = "";
+  if (!executedModel) {
+    exit = exit || 1;
+    error = "cursor-agent stream did not include an init model identity";
+  } else if (streamReportedError) {
+    exit = exit || 1;
+    error = "cursor-agent reported an error result";
+  } else if (completion.error) {
+    error = "cursor-agent could not be started";
+  } else if (completion.signal) {
+    error = `cursor-agent terminated by signal ${completion.signal}`;
+  } else if (exit !== 0) {
+    error = `cursor-agent exited with status ${exit}`;
+  }
+  void stderr;
+  return { executedModels: executedModel ? [executedModel] : [], finalText, exit, error };
+}
+
+async function main() {
+  const argv = process.argv.slice(2);
+  if (argv.length === 1 && argv[0] === "--readiness") return readiness();
+
+  let parsed;
+  try {
+    parsed = parseArgs(argv);
+    if (parsed.task && !parsed.task.includes(MARKER)) throw new Error("task is missing cursor_cli lane marker");
+    if (!parsed.model) throw new Error("missing model");
+    if (!parsed.prompt) throw new Error("missing prompt");
+  } catch (error) {
+    result("failed", [], "", 2, error.message);
+    return 2;
+  }
+
+  const cursorAgent = findExecutable("cursor-agent");
+  const realGit = findExecutable("git");
+  if (!cursorAgent || !realGit) {
+    result("failed", [], "", 127, !cursorAgent ? "cursor-agent not found" : "git not found");
+    return 127;
+  }
+
+  let worktree;
+  try {
+    worktree = validateWorktree(parsed.worktree, realGit);
+  } catch (error) {
+    result("failed", [], "", 2, error.message);
+    return 2;
+  }
+
+  let beforeSnapshot;
+  let restoreRepositoryGuard;
+  try {
+    beforeSnapshot = protectedRemoteSnapshot(realGit, worktree);
+    restoreRepositoryGuard = installRepositoryGuard(realGit, worktree);
+  } catch (error) {
+    result("failed", [], "", 1, error.message);
+    return 1;
+  }
+
+  let commandGuards;
+  try {
+    commandGuards = createCommandGuards(realGit, findExecutable("gh"), worktree);
+  } catch (error) {
+    try {
+      restoreRepositoryGuard();
+    } catch {
+      result("integrity_violation", [], "", 70, "repository safety configuration could not be restored");
+      return 70;
+    }
+    result("failed", [], "", 1, error.message);
+    return 1;
+  }
+  let execution;
+  let integrityError = "";
+  try {
+    try {
+      execution = await runCursor(cursorAgent, worktree, parsed.model, parsed.prompt, commandGuards);
+    } catch {
+      execution = { executedModels: [], finalText: "", exit: 1, error: "cursor-agent execution failed" };
+    }
+    try {
+      const afterSnapshot = protectedRemoteSnapshot(realGit, worktree, beforeSnapshot.targets);
+      if (!snapshotsMatch(beforeSnapshot, afterSnapshot)) {
+        integrityError = "protected remote branch moved during cursor-agent execution";
+      }
+    } catch {
+      integrityError = "protected remote branch state could not be verified after cursor-agent execution";
+    }
+  } finally {
+    rmSync(commandGuards.directory, { recursive: true, force: true });
+    try {
+      restoreRepositoryGuard();
+    } catch {
+      integrityError = integrityError || "repository safety configuration could not be restored";
+    }
+  }
+
+  if (integrityError) {
+    result("integrity_violation", execution.executedModels, execution.finalText, 70, integrityError);
+    return 70;
+  }
+  try {
+    result(
+      execution.exit === 0 ? "completed" : "failed",
+      execution.executedModels,
+      execution.finalText,
+      execution.exit,
+      execution.error,
+    );
+    return execution.exit;
+  } catch {
+    return 1;
+  }
+}
+
+process.exitCode = await main();

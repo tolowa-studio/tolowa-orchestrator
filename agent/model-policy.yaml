@@ -1,0 +1,99 @@
+spec_version: 2
+
+# Standing operator model requests. Each entry's `verified` field is the only
+# verification claim; `listed` entries have not been test-called.
+# Tier is chosen by WORK TYPE, not by the orchestrator's judgment, unless the operator names a model.
+# Each dispatch records requested tier+model and the execution-confirmed model.
+# A requested-versus-executed mismatch is a STOP.
+# The `model` keys in ~/.claude/settings.json and ~/.claude-lean/settings.json
+# are fallbacks for unpinned interactive launches, not routing decisions.
+
+roles:
+  orchestrator: { model: claude-sonnet-5, vendor: Anthropic, role: "coordinate and operate" }
+  claude_code:  { tier: deep_think, model: "claude-opus-5-5[1m]", vendor: Anthropic, role: "design and deep thinking" }
+  codex:        { tier: deep_think, model: gpt-6-sol, vendor: OpenAI, role: "review" }
+  cursor_cli:   { tier: execute, model: composer-2.5, vendor: "Cursor (Anysphere)", role: "all repository implementation in isolated worktrees" }
+  cursor:       { tier: deep_think, model: grok-4.7-high, vendor: xAI, role: "native Omnigent inline-diff review only" }
+  hermes:       { tier: execute, model: deepseek-ai/DeepSeek-V4-Pro, vendor: DeepSeek, role: "implementation on m2-mini" }
+  pi:           { tier: execute, model: zai-org/GLM-5.3-Flash, vendor: Z.ai, role: "Bash and local mechanical work" }
+
+tiers:
+  execute:
+    description: >
+      Implementation and mechanical execution. Cursor owns repository work,
+      Hermes is a first-class implement lane, and Pi owns Bash/local mechanics.
+    cursor_cli:  { model: composer-2.5,                verified: test-called 2026-09-23, vendor: "Cursor (Anysphere)" }
+    cursor_alt:  { model: claude-sonnet-5,             verified: test-called 2026-09-23, vendor: Anthropic }
+    hermes:      { model: deepseek-ai/DeepSeek-V4-Pro, verified: "test-called 2026-09-24 (operator-reported implement task, approximately $0.36)", vendor: DeepSeek }
+    pi:          { model: zai-org/GLM-5.3-Flash,       verified: "listed 2026-09-24 (local Omnigent config; not test-called)", vendor: Z.ai }
+
+  deep_think:
+    description: >
+      Design, analysis, adversarial review, validation, and hard debugging.
+      Claude/Opus designs; Codex reviews; DeepInfra models add review/reasoning.
+    cursor:      { model: grok-4.7-high,               verified: test-called 2026-09-23, vendor: xAI }
+    codex:       { model: gpt-6-sol,                   verified: test-called 2026-09-23, vendor: OpenAI }
+    claude_code: { model: "claude-opus-5-5[1m]",       verified: "listed 2026-09-24 (sys_list_models cli-probe; not test-called)", vendor: Anthropic }
+    hermes:      { model: deepseek-ai/DeepSeek-V4-Pro, verified: test-called 2026-09-23, vendor: DeepSeek }
+
+  architect:
+    description: >
+      Big planning and architecture ONLY. REASONING ONLY — this tier NEVER builds.
+      It may not hold a worktree, write a file, or take purpose=implement.
+      Never self-escalated; requires an explicit operator request.
+    claude_code: { model: "claude-opus-5-5[1m]",       verified: "listed 2026-09-24 (sys_list_models cli-probe; not test-called)", purpose: reasoning-only, vendor: Anthropic }
+    validator:   { model: grok-4.7-xhigh,              verified: test-called 2026-09-23, vendor: xAI, role: "validates what the architects produce" }
+
+  cheap:
+    description: Classification, deduplication, bulk sorting only.
+    pi:          { model: zai-org/GLM-5.3-Flash,       verified: "listed 2026-09-24 (local Omnigent config; not test-called)", vendor: Z.ai }
+
+# Read-only evidence from m2-mini on 2026-09-24: tolowa-builder/config.yaml
+# selects DeepInfra + deepseek-ai/DeepSeek-V4-Pro; the profile's DeepInfra model
+# cache lists the exact additional ids below. `listed` never means test-called.
+deepinfra_reviewer_reasoner_models:
+  - { model: google/gemma-4-26B-A4B-it, vendor: Google, verified: "listed 2026-09-24 (m2-mini Hermes DeepInfra cache; not test-called)" }
+  - { model: google/gemma-4-31B-it, vendor: Google, verified: "listed 2026-09-24 (m2-mini Hermes DeepInfra cache; not test-called)" }
+  - { model: google/gemma-4-E4B-it, vendor: Google, verified: "listed 2026-09-24 (m2-mini Hermes DeepInfra cache; not test-called)" }
+  - { model: zai-org/GLM-5.3-Flash, vendor: Z.ai, verified: "listed 2026-09-24 (m2-mini Hermes DeepInfra cache and local Pi config; not test-called)" }
+  - { model: moonshotai/Kimi-K2.5, vendor: Moonshot, verified: "listed 2026-09-24 (m2-mini Hermes DeepInfra cache; not test-called)" }
+  - { model: moonshotai/Kimi-K2.6, vendor: Moonshot, verified: "listed 2026-09-24 (m2-mini Hermes DeepInfra cache; not test-called)" }
+  - { model: moonshotai/Kimi-K2.7-Code, vendor: Moonshot, verified: "listed 2026-09-24 (m2-mini Hermes DeepInfra cache; not test-called)" }
+  - { model: moonshotai/Kimi-K3, vendor: Moonshot, verified: "listed 2026-09-24 (m2-mini Hermes DeepInfra cache; not test-called)" }
+  - { model: deepseek-ai/DeepSeek-V4-Pro, vendor: DeepSeek, verified: "test-called 2026-09-24 (operator-reported implement task, approximately $0.36)" }
+  - { model: deepseek-ai/DeepSeek-V4.1-Flash, vendor: DeepSeek, verified: "listed 2026-09-24 (m2-mini Hermes DeepInfra cache; not test-called)" }
+
+known_gaps:
+  - "gpt-5.6-terra is SUPERSEDED by gpt-5.6-sol. It still answers (aliased), but do not pin it."
+  - "A requested Cursor model pin is a request, not evidence. cursor-agent --output-format json
+     and transcripts report no executed model (TOL-677); --output-format stream-json reports
+     the authoritative executed model in its init event (checked 2026-09-24, Stash 28827)."
+  - "The cursor_cli worktree lane is being built in dotfiles PR #36. Until it lands, run
+     cursor-agent directly inside each isolated worktree with -p --trust --model <m>
+     --output-format stream-json and capture the init-event model. Native Omnigent cursor
+     sub-agents are inline-diff reviewers only and receive no implementation worktree. Never
+     share one directory between two Cursor CLI sessions."
+  - "service_tier is an API-billing concept and must NOT appear in ~/.codex/config.toml — Codex is
+     authenticated by ChatGPT subscription. It was set to flex and silently 400'd every dispatch."
+
+rules:
+  - The orchestrator runs on claude-sonnet-5; Claude design/thinking uses claude_code deep_think (claude-opus-5-5[1m]).
+  - Codex is the repository review lane; cursor_cli owns repository implementation in isolated worktrees; native Omnigent cursor is inline-diff review only; Hermes implements on m2-mini; Pi owns Bash/local mechanical work.
+  - Cursor/Composer implementation receives Codex review plus an additional DeepInfra-model review/reasoning pass. Every counted reviewer vendor differs from the implementer vendor.
+  - If Codex or Hermes performs implementation, its reviewer must execute on a different model vendor.
+  - "Gemma 4, GLM, Kimi, and DeepSeek on DeepInfra are additional reviewers/reasoners; route by the exact model ids and vendor labels in deepinfra_reviewer_reasoner_models. Direct mode is: node ~/repos/motion-core/bin/baton-lane.mjs --lane deepinfra --model <id> (motion-core PR #120); its lane event supplies execution identity."
+  - Keep all available lanes busy with independent work. Never serialize independent tasks; only Cursor sessions sharing the same working directory are forbidden.
+  - When a rule is unknown, ask the operator in the same message, propose the rule, and continue every independent workstream.
+  - Never escalate to architect on the orchestrator's own judgment.
+  - architect tier is reasoning only. It never builds, never holds a worktree, never gets purpose=implement.
+  - Situation (task class) selects the tier; the tier table selects the model per lane. Changing which model serves a situation is a one-line tier entry edit, not a rule rewrite.
+  - Route by the roles and tier tables unless the operator names a model. Claude Opus (claude-opus-5-5[1m]) is for design/thinking, not building. An explicit operator model request wins, subject to fail-closed availability and requested-versus-executed rules.
+  - "A tier entry marked `verified: listed` has not been test-called. The first dispatch to it is a probe whose executed model must be confirmed before the result is relied on, and architect entries never take purpose=implement or a worktree."
+  - cursor_alt is used only when the default Cursor model is unavailable. It is Anthropic, so counted reviewers must execute on other vendors; use Codex/OpenAI plus a non-Anthropic DeepInfra model.
+  - validator is used only to validate architect-tier output.
+  - Never dispatch unpinned. A lane default is an unowned decision.
+  - Record requested tier and model plus executed model on every dispatch.
+  - A requested-versus-executed mismatch is a STOP.
+  - "Authoritative execution identity comes from a lane/platform record when present: BATON lane-event executed_model, Cursor stream-json init model, another platform record, or Hermes tolowa-builder profile session_model_usage. A model's self-reported EXECUTED_MODEL line does not override that record."
+  - "Hermes identity is CONFIRMED when the tolowa-builder profile's session_model_usage contains the executed model."
+  - "Resolve composer-* and the display string Composer to vendor Cursor (Anysphere)."
