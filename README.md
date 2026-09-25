@@ -31,14 +31,16 @@ Runs across **Claude Code, Codex, Cursor, Hermes, Pi**, plus **DeepInfra** model
 
 The native Omnigent `cursor` lane is interactive and its approve buttons can disappear mid-run. The CLI lane is non-interactive, so there is nothing to approve.
 
-## Omnigent issues we hit (0.14-0.15)
+## Omnigent issues we hit
 
-1. Sub-agents stay on the parent's runner; a session can't place children on another machine.
-2. `hermes-native`: per-session `HERMES_HOME` never copies `state.db`; the forwarder's `sqlite3.connect` silently creates an empty DB, so every query fails "no such table: sessions" (messages in, none out).
-3. `model_catalog.py` warns that `hermes-native` has no model-provider resolution; no caller enforces it and `harness_plugins.py` already declares `OWN_AUTH` for it.
-4. With subscription-only providers, `sys_list_models` returns empty and `args.model` is ignored.
-5. `codex-native` writes its own per-session `config.toml`, overriding the configured Codex model.
-6. `pi_native_executor.py` ignores the system prompt/tools and returns no response text; we use the headless `pi` harness.
+First seen on 0.14; source re-checked against **0.15.0** on 2026-09-25.
+
+1. Sub-agents stay on the parent's runner; a session can't place children on another machine. *(0.14; not re-checked on 0.15.0)*
+2. `hermes-native`: per-session `HERMES_HOME` never gets `state.db`, and the forwarder's plain-connect fallback (`harnesses/hermes_native/forwarder.py:396-400`) silently creates an empty DB, so every query fails "no such table: sessions" (messages in, none out). *Fallback still present in 0.15.0.*
+3. `hermes-native` isn't in `_PROVIDER_RESOLUTION_HARNESS` (`models/model_catalog.py:128`), so it warns there is no model-provider resolution; the warning is advisory and `harness_plugins.py` already declares `OWN_AUTH`. *Dict still present in 0.15.0; advisory behavior not re-tested.*
+4. With subscription-only providers, `sys_list_models` returns empty and `args.model` is ignored. *(0.14 config-specific; not re-checked)*
+5. `codex-native` writes its own per-session `config.toml`, overriding the configured Codex model. *(observed 0.14; not re-checked)*
+6. `pi_native_executor.py` ignores the system prompt/tools and returns `TurnComplete(response=None)` (line 102); we use the headless `pi` harness. *Still present in 0.15.0.*
 
 ## Caveats
 
