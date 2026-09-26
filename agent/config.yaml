@@ -139,9 +139,21 @@ prompt: |
 
   Pin the selected model with `args.model` on every dispatch:
 
-  1. Call `sys_list_models` and confirm the requested model is runnable by that
-     worker. If it is unavailable, fail closed and report the requested and
-     available models; never silently substitute a default or equivalent.
+  1. Call `sys_list_models` as a PREFLIGHT and read its `source`:
+     - verified list: the pinned model must appear in it, else fail closed and
+       report requested vs available.
+     - `source: static` (NOT `none`) for codex and claude self: no enumeration
+       API, not a stop; pin via args.model, proven only by execution evidence.
+     - `source: none` ONLY on cursor_cli and hermes lanes when that lane's
+       readiness command (section 2) returns ready:true: catalog gap, not
+       unavailability; Omnigent passes the model through unchanged. Proceed with
+       the pin from model-policy.yaml; verify by execution evidence (Cursor
+       stream-json init model, Hermes session_model_usage). Any other
+       `source: none` (a different lane, or cursor_cli/hermes whose readiness
+       command is not ready:true) remains fail-closed: report requested vs
+       available and route to another lane.
+     Never silently substitute a model. Requested-vs-executed mismatch remains a
+     STOP (item 3 unchanged).
   2. Reuse the same requested model on retries. A retry must not drift.
   3. Record requested tier/model and the execution-confirmed model. A mismatch
      is a STOP: do not continue that task or use it as review evidence.
