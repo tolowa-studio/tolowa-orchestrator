@@ -40,8 +40,8 @@ First seen on 0.14; source re-checked against **0.15.0** on 2026-09-25.
 3. `hermes-native` isn't in `_PROVIDER_RESOLUTION_HARNESS` (`models/model_catalog.py:128`), so it warns there is no model-provider resolution; the warning is advisory and `harness_plugins.py` already declares `OWN_AUTH`. *Dict still present in 0.15.0; advisory behavior not re-tested.*
 4. The catalog also has no entry for the `hermes` harness, so `sys_list_models` returns `source: none` for the `cursor_cli` and `hermes` lanes even when they are ready. Omnigent's own gate passes the model through unchanged; our §4 now treats this as a preflight gap and proves the pin by execution evidence instead of stopping. *(Observed on 0.15.0.)*
 5. With subscription-only providers, `sys_list_models` returns empty and `args.model` is ignored. *(0.14 config-specific; not re-checked)*
-5. `codex-native` writes its own per-session `config.toml`, overriding the configured Codex model. *(observed 0.14; not re-checked)*
-6. `pi_native_executor.py` ignores the system prompt/tools and returns `TurnComplete(response=None)` (line 102); we use the headless `pi` harness. *Still present in 0.15.0.*
+6. `codex-native` writes its own per-session `config.toml`, overriding the configured Codex model. *(observed 0.14; not re-checked)*
+7. `pi_native_executor.py` ignores the system prompt/tools and returns `TurnComplete(response=None)` (line 102); we use the headless `pi` harness. *Still present in 0.15.0.*
 
 ## Caveats
 
